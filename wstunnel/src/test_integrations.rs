@@ -1,5 +1,6 @@
 use crate::embedded_certificate;
 use crate::executor::DefaultTokioExecutor;
+use crate::identity::api_keys::ApiKeyValidator;
 use crate::protocols;
 use crate::protocols::dns::DnsResolver;
 use crate::restrictions::types;
@@ -13,7 +14,8 @@ use crate::tunnel::upstream_connectors::TcpUpstreamConnector;
 use crate::tunnel::{LocalProtocol, RemoteAddr};
 use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
-use hyper::http::HeaderValue;
+use hyper::header::AUTHORIZATION;
+use hyper::http::{HeaderName, HeaderValue};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use regex::Regex;
 use rstest::{fixture, rstest};
@@ -74,8 +76,7 @@ fn dns_resolver() -> DnsResolver {
     DnsResolver::new_from_urls(&[], None, SoMark::new(None), true).expect("Cannot create DNS resolver")
 }
 
-#[fixture]
-fn server_no_tls(dns_resolver: DnsResolver) -> Server {
+fn mk_server_no_tls(dns_resolver: DnsResolver, api_keys: ApiKeyValidator) -> Server {
     let server_config = ServerConfig {
         socket_so_mark: SoMark::new(None),
         bind: free_addr().0,
@@ -88,8 +89,14 @@ fn server_no_tls(dns_resolver: DnsResolver) -> Server {
         http_proxy: None,
         remote_server_idle_timeout: Duration::from_secs(30),
         enable_webtransport: false,
+        api_keys,
     };
     Server::new(server_config, DefaultTokioExecutor::default())
+}
+
+#[fixture]
+fn server_no_tls(dns_resolver: DnsResolver) -> Server {
+    mk_server_no_tls(dns_resolver, Default::default())
 }
 
 /// Server serving webtransport over UDP, alongside websocket/http2 over TCP.
@@ -114,6 +121,7 @@ fn server_webtransport(dns_resolver: DnsResolver) -> Server {
         http_proxy: None,
         remote_server_idle_timeout: Duration::from_secs(30),
         enable_webtransport: true,
+        api_keys: Default::default(),
     };
     Server::new(server_config, DefaultTokioExecutor::default())
 }
@@ -169,14 +177,18 @@ async fn client_webtransport(server_port: u16, dns_resolver: DnsResolver) -> Cli
 }
 
 /// Not a fixture, as the port to dial is only known once the server fixture has picked one.
-async fn client_ws(server_port: u16, dns_resolver: DnsResolver) -> Client {
+async fn client_ws_with_headers(
+    server_port: u16,
+    dns_resolver: DnsResolver,
+    http_headers: HashMap<HeaderName, HeaderValue>,
+) -> Client {
     let client_config = ClientConfig {
         remote_addr: TransportAddr::new(TransportScheme::Ws, Host::Ipv4(Ipv4Addr::LOCALHOST), server_port, None)
             .unwrap(),
         socket_so_mark: SoMark::new(None),
         http_upgrade_path_prefix: "wstunnel".to_string(),
         http_upgrade_credentials: None,
-        http_headers: HashMap::new(),
+        http_headers,
         http_headers_file: None,
         http_header_host: HeaderValue::from_str(&format!("127.0.0.1:{server_port}")).unwrap(),
         timeout_connect: Duration::from_secs(10),
@@ -198,6 +210,10 @@ async fn client_ws(server_port: u16, dns_resolver: DnsResolver) -> Client {
     .unwrap()
 }
 
+async fn client_ws(server_port: u16, dns_resolver: DnsResolver) -> Client {
+    client_ws_with_headers(server_port, dns_resolver, HashMap::new()).await
+}
+
 #[fixture]
 fn no_restrictions() -> RestrictionsRules {
     pub fn default_host() -> Regex {
@@ -213,6 +229,8 @@ fn no_restrictions() -> RestrictionsRules {
         port: vec![],
         host: default_host(),
         cidr: default_cidr(),
+        max_concurrent_tunnels: 0,
+        rate_limit_bytes_per_sec: 0,
     });
     let reverse_tunnel = AllowConfig::ReverseTunnel(types::AllowReverseTunnelConfig {
         protocol: vec![],
@@ -273,6 +291,71 @@ async fn test_tcp_tunnel(server_no_tls: Server, no_restrictions: RestrictionsRul
     dd.write_all(b"world!").await.unwrap();
     client.read_buf(&mut buf).await.unwrap();
     assert_eq!(&buf[..6], b"world!");
+}
+
+#[rstest]
+#[case::valid_key(Some("ApiKey ci-secret"), true)]
+#[case::wrong_key(Some("ApiKey wrong-secret"), false)]
+#[case::no_key(None, false)]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+#[serial]
+async fn test_tcp_tunnel_api_key(
+    #[case] authorization: Option<&str>,
+    #[case] should_connect: bool,
+    no_restrictions: RestrictionsRules,
+    dns_resolver: DnsResolver,
+) {
+    let (tunnel_listen, tunnel_host) = free_addr();
+    let (endpoint_listen, endpoint_host) = free_addr();
+
+    let server = mk_server_no_tls(
+        dns_resolver.clone(),
+        ApiKeyValidator::new([("ci".to_string(), "ci-secret".to_string())]),
+    );
+    let server_port = server.config.bind.port();
+    let server_h = tokio::spawn(server.serve(no_restrictions));
+    defer! { server_h.abort(); };
+
+    let mut http_headers = HashMap::new();
+    if let Some(authorization) = authorization {
+        http_headers.insert(AUTHORIZATION, HeaderValue::from_str(authorization).unwrap());
+    }
+    let client_ws = client_ws_with_headers(server_port, dns_resolver.clone(), http_headers).await;
+
+    let server = TcpDownstreamListener::new(tunnel_listen, (endpoint_host, endpoint_listen.port()), false)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = client_ws.run_tunnel(server).await;
+    });
+
+    let mut tcp_listener = protocols::tcp::run_server(endpoint_listen, false).await.unwrap();
+    let mut client = protocols::tcp::connect(
+        &tunnel_host,
+        tunnel_listen.port(),
+        SoMark::new(None),
+        Duration::from_secs(10),
+        &dns_resolver,
+    )
+    .await
+    .unwrap();
+    let _ = client.write_all(b"Hello").await;
+
+    if !should_connect {
+        // The server must refuse the upgrade, so no upstream connection is ever opened.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), tcp_listener.next())
+                .await
+                .is_err()
+        );
+        return;
+    }
+
+    let mut dd = tcp_listener.next().await.unwrap().unwrap();
+    let mut buf = BytesMut::new();
+    dd.read_buf(&mut buf).await.unwrap();
+    assert_eq!(&buf[..5], b"Hello");
 }
 
 #[rstest]

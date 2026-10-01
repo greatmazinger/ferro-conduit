@@ -1,4 +1,5 @@
 use crate::LocalProtocol;
+use crate::identity::{AuthMethod, VerifiedIdentity};
 use crate::restrictions::types::{
     AllowConfig, AllowReverseTunnelConfig, AllowTunnelConfig, MatchConfig, RestrictionConfig, RestrictionsRules,
     ReverseTunnelProtocol, TunnelProtocol,
@@ -111,13 +112,34 @@ pub(super) fn extract_tunnel_info<B>(req: &Request<B>) -> anyhow::Result<TokenDa
 }
 
 impl RestrictionConfig {
-    /// Returns true if the parameters match the restriction config
+    /// Returns true if the connection parameters match ALL conditions in this
+    /// restriction's `match` list.
     #[inline]
-    fn filter(self: &RestrictionConfig, path_prefix: &str, authorization_header_val: Option<&str>) -> bool {
+    fn filter(
+        self: &RestrictionConfig,
+        path_prefix: &str,
+        authorization_header_val: Option<&str>,
+        identity: Option<&VerifiedIdentity>,
+    ) -> bool {
         self.r#match.iter().all(|m| match m {
             MatchConfig::Any => true,
             MatchConfig::PathPrefix(path) => path.is_match(path_prefix),
             MatchConfig::Authorization(auth) => authorization_header_val.is_some_and(|val| auth.is_match(val)),
+            MatchConfig::ApiKey(re) => identity.is_some_and(|id| {
+                id.auth_method == AuthMethod::ApiKey
+                    && id
+                        .subject
+                        .strip_prefix("api-key:")
+                        .is_some_and(|name| re.is_match(name))
+            }),
+            MatchConfig::IdentitySubject(re) => identity.is_some_and(|id| re.is_match(&id.subject)),
+            MatchConfig::IdentityGroup(re) => identity.is_some_and(|id| id.groups.iter().any(|g| re.is_match(g))),
+            MatchConfig::SpiffeId(re) => {
+                identity.is_some_and(|id| id.spiffe_id.as_deref().is_some_and(|s| re.is_match(s)))
+            }
+            MatchConfig::AuthMethod(methods) => {
+                identity.is_some_and(|id| methods.iter().any(|m| *m == id.auth_method.to_string()))
+            }
         })
     }
 }
@@ -198,12 +220,13 @@ pub(super) fn validate_tunnel<'a>(
     remote: &RemoteAddr,
     path_prefix: &str,
     authorization: Option<&str>,
+    identity: Option<&VerifiedIdentity>,
     restrictions: &'a RestrictionsRules,
 ) -> Option<&'a RestrictionConfig> {
     restrictions
         .restrictions
         .iter()
-        .filter(|restriction| restriction.filter(path_prefix, authorization))
+        .filter(|restriction| restriction.filter(path_prefix, authorization, identity))
         .find(|restriction| restriction.allow.iter().any(|allow| allow.is_allowed(remote)))
 }
 
@@ -216,12 +239,13 @@ pub(super) fn validate_tunnel<'a>(
 pub(super) fn matches_any_restriction(
     path_prefix: &str,
     authorization: Option<&str>,
+    identity: Option<&VerifiedIdentity>,
     restrictions: &RestrictionsRules,
 ) -> bool {
     restrictions
         .restrictions
         .iter()
-        .any(|restriction| restriction.filter(path_prefix, authorization))
+        .any(|restriction| restriction.filter(path_prefix, authorization, identity))
 }
 
 pub(super) fn inject_cookie(response: &mut http::Response<impl Body>, remote_addr: &RemoteAddr) -> Result<(), ()> {
@@ -237,6 +261,7 @@ pub(super) fn inject_cookie(response: &mut http::Response<impl Body>, remote_add
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::api_keys::ApiKeyValidator;
     use crate::restrictions::types::{AllowReverseTunnelConfig, AllowTunnelConfig, default_cidr, default_host};
     use crate::tunnel::LocalProtocol;
     use ipnet::{IpNet, Ipv4Net};
@@ -257,6 +282,8 @@ mod tests {
                         port: vec![80..=80],
                         cidr: vec![IpNet::from(Ipv4Net::new([127, 0, 0, 1].into(), 24).unwrap())],
                         host: Regex::new("example.com").unwrap(),
+                        max_concurrent_tunnels: 0,
+                        rate_limit_bytes_per_sec: 0,
                     })],
                 },
                 // reverse tunnel
@@ -280,7 +307,7 @@ mod tests {
             port: 80,
         };
         assert_eq!(
-            validate_tunnel(&remote, "/doesnt/matter", None, &restrictions)
+            validate_tunnel(&remote, "/doesnt/matter", None, None, &restrictions)
                 .unwrap()
                 .name,
             restrictions.restrictions[0].name
@@ -292,7 +319,7 @@ mod tests {
             port: 80,
         };
         assert_eq!(
-            validate_tunnel(&remote, "/doesnt/matter", None, &restrictions)
+            validate_tunnel(&remote, "/doesnt/matter", None, None, &restrictions)
                 .unwrap()
                 .name,
             restrictions.restrictions[1].name
@@ -303,14 +330,14 @@ mod tests {
             host: Host::Ipv4([127, 0, 0, 1].into()),
             port: 81,
         };
-        assert!(validate_tunnel(&remote, "/doesnt/matter", None, &restrictions).is_none());
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, None, &restrictions).is_none());
 
         let remote = RemoteAddr {
             protocol: LocalProtocol::Tcp { proxy_protocol: false },
             host: Host::Ipv4([127, 0, 1, 1].into()),
             port: 80,
         };
-        assert!(validate_tunnel(&remote, "/doesnt/matter", None, &restrictions).is_none());
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, None, &restrictions).is_none());
 
         let remote = RemoteAddr {
             protocol: LocalProtocol::Tcp { proxy_protocol: false },
@@ -318,7 +345,7 @@ mod tests {
             port: 80,
         };
         assert_eq!(
-            validate_tunnel(&remote, "/doesnt/matter", None, &restrictions)
+            validate_tunnel(&remote, "/doesnt/matter", None, None, &restrictions)
                 .unwrap()
                 .name,
             restrictions.restrictions[0].name
@@ -329,14 +356,14 @@ mod tests {
             host: Host::Domain("not.com".into()),
             port: 80,
         };
-        assert!(validate_tunnel(&remote, "/doesnt/matter", None, &restrictions).is_none());
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, None, &restrictions).is_none());
 
         let remote = RemoteAddr {
             protocol: LocalProtocol::Tcp { proxy_protocol: false },
             host: Host::Ipv6(Ipv6Addr::LOCALHOST),
             port: 80,
         };
-        assert!(validate_tunnel(&remote, "/doesnt/matter", None, &restrictions).is_none());
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, None, &restrictions).is_none());
     }
 
     #[test]
@@ -352,6 +379,8 @@ mod tests {
                     port: vec![],
                     cidr: default_cidr(),
                     host: default_host(),
+                    max_concurrent_tunnels: 0,
+                    rate_limit_bytes_per_sec: 0,
                 })],
             }],
         };
@@ -362,13 +391,22 @@ mod tests {
             port: 80,
         };
         assert_eq!(
-            validate_tunnel(&remote, "/doesnt/matter", Some("Bearer the-bearer-token"), &restrictions)
+            validate_tunnel(&remote, "/doesnt/matter", Some("Bearer the-bearer-token"), None, &restrictions)
                 .unwrap()
                 .name,
             restrictions.restrictions[0].name
         );
-        assert!(validate_tunnel(&remote, "/doesnt/matter", Some("Bearer other-bearer-token"), &restrictions).is_none());
-        assert!(validate_tunnel(&remote, "/doesnt/matter", None, &restrictions).is_none());
+        assert!(
+            validate_tunnel(
+                &remote,
+                "/doesnt/matter",
+                Some("Bearer other-bearer-token"),
+                None,
+                &restrictions
+            )
+            .is_none()
+        );
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, None, &restrictions).is_none());
     }
 
     #[test]
@@ -510,6 +548,8 @@ mod tests {
             port: vec![80..=80],
             cidr: vec![IpNet::from(Ipv4Net::new([127, 0, 0, 1].into(), 8).unwrap())],
             host: Regex::new(".*").unwrap(),
+            max_concurrent_tunnels: 0,
+            rate_limit_bytes_per_sec: 0,
         };
 
         let remote = RemoteAddr {
@@ -546,6 +586,8 @@ mod tests {
             port: vec![80..=80],
             cidr: vec![IpNet::from(Ipv4Net::new([127, 0, 0, 1].into(), 24).unwrap())],
             host: Regex::new("example.com").unwrap(),
+            max_concurrent_tunnels: 0,
+            rate_limit_bytes_per_sec: 0,
         };
 
         // wrong IP
@@ -628,5 +670,90 @@ mod tests {
         assert_eq!(extract_path_prefix("prefix/events"), Err(PathPrefixErr::BadPathPrefix));
         assert_eq!(extract_path_prefix("prefix/a/events"), Err(PathPrefixErr::BadPathPrefix));
         assert_eq!(extract_path_prefix("prefix/a/b/events"), Err(PathPrefixErr::BadPathPrefix));
+    }
+
+    #[test]
+    fn test_validate_tunnel_identity_matchers() {
+        let api_key_identity = ApiKeyValidator::new([("ci".to_string(), "ci-secret".to_string())])
+            .validate("ci-secret")
+            .unwrap();
+        let oidc_identity = VerifiedIdentity {
+            subject: "alice".into(),
+            display_name: None,
+            groups: vec!["engineering".into()],
+            spiffe_id: None,
+            auth_method: AuthMethod::OidcBearer,
+            expires_at: None,
+        };
+
+        let remote = RemoteAddr {
+            protocol: LocalProtocol::Tcp { proxy_protocol: false },
+            host: Host::Domain("google.com".into()),
+            port: 80,
+        };
+
+        let allow = AllowConfig::Tunnel(AllowTunnelConfig {
+            protocol: vec![],
+            port: vec![],
+            cidr: default_cidr(),
+            host: default_host(),
+            max_concurrent_tunnels: 0,
+            rate_limit_bytes_per_sec: 0,
+        });
+
+        // ApiKey matcher matches the api-key identity, not the oidc identity, not None
+        let restrictions = RestrictionsRules {
+            restrictions: vec![RestrictionConfig {
+                name: "apikey_match".into(),
+                r#match: vec![MatchConfig::ApiKey(Regex::new("^ci$").unwrap())],
+                allow: vec![allow.clone()],
+            }],
+        };
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, Some(&api_key_identity), &restrictions).is_some());
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, Some(&oidc_identity), &restrictions).is_none());
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, None, &restrictions).is_none());
+
+        // ApiKey matcher with a non-matching name does not match the api-key identity
+        let restrictions = RestrictionsRules {
+            restrictions: vec![RestrictionConfig {
+                name: "apikey_no_match".into(),
+                r#match: vec![MatchConfig::ApiKey(Regex::new("^other$").unwrap())],
+                allow: vec![allow.clone()],
+            }],
+        };
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, Some(&api_key_identity), &restrictions).is_none());
+
+        // IdentitySubject matches the oidc identity, not None
+        let restrictions = RestrictionsRules {
+            restrictions: vec![RestrictionConfig {
+                name: "subject_match".into(),
+                r#match: vec![MatchConfig::IdentitySubject(Regex::new("^alice$").unwrap())],
+                allow: vec![allow.clone()],
+            }],
+        };
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, Some(&oidc_identity), &restrictions).is_some());
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, None, &restrictions).is_none());
+
+        // IdentityGroup matches the oidc identity, not the api-key identity
+        let restrictions = RestrictionsRules {
+            restrictions: vec![RestrictionConfig {
+                name: "group_match".into(),
+                r#match: vec![MatchConfig::IdentityGroup(Regex::new("^engineering$").unwrap())],
+                allow: vec![allow.clone()],
+            }],
+        };
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, Some(&oidc_identity), &restrictions).is_some());
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, Some(&api_key_identity), &restrictions).is_none());
+
+        // AuthMethod matches the api-key identity, not the oidc identity
+        let restrictions = RestrictionsRules {
+            restrictions: vec![RestrictionConfig {
+                name: "authmethod_match".into(),
+                r#match: vec![MatchConfig::AuthMethod(vec!["ApiKey".to_string()])],
+                allow: vec![allow.clone()],
+            }],
+        };
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, Some(&api_key_identity), &restrictions).is_some());
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, Some(&oidc_identity), &restrictions).is_none());
     }
 }

@@ -27,6 +27,8 @@ impl RestrictionsRules {
                 port: vec![],
                 host: default_host(),
                 cidr: default_cidr(),
+                max_concurrent_tunnels: 0,
+                rate_limit_bytes_per_sec: 0,
             });
             let reverse_tunnel = types::AllowConfig::ReverseTunnel(types::AllowReverseTunnelConfig {
                 protocol: vec![],
@@ -47,6 +49,8 @@ impl RestrictionsRules {
                             port: vec![RangeInclusive::new(*port, *port)],
                             host: Regex::new("^$")?,
                             cidr: vec![IpNet::new(ip, if ip.is_ipv4() { 32 } else { 128 })?],
+                            max_concurrent_tunnels: 0,
+                            rate_limit_bytes_per_sec: 0,
                         })]
                     } else {
                         vec![types::AllowConfig::Tunnel(types::AllowTunnelConfig {
@@ -54,6 +58,8 @@ impl RestrictionsRules {
                             port: vec![RangeInclusive::new(*port, *port)],
                             host: Regex::new(&format!("^{}$", regex::escape(host)))?,
                             cidr: vec![],
+                            max_concurrent_tunnels: 0,
+                            rate_limit_bytes_per_sec: 0,
                         })]
                     };
 

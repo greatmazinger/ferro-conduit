@@ -20,11 +20,39 @@ pub struct RestrictionConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub enum MatchConfig {
+    /// Matches any connection (wildcard).
     Any,
+    /// Matches if the HTTP upgrade path prefix satisfies the regex.
     #[serde(with = "serde_regex")]
     PathPrefix(Regex),
+    /// Matches if the raw `Authorization` header value satisfies the regex.
+    /// Use this for simple bearer-token patterns or legacy shared secrets.
     #[serde(with = "serde_regex")]
     Authorization(Regex),
+    /// Matches if the client authenticated with a server-configured API key
+    /// (`--api-key NAME=VALUE`) whose NAME satisfies the regex.
+    /// Example: `!ApiKey "^ci$"`
+    #[serde(with = "serde_regex")]
+    ApiKey(Regex),
+    /// Matches if the verified identity subject satisfies the regex.
+    /// The subject format depends on the auth method:
+    /// - API key:  `"api-key:<name>"`
+    /// - OIDC:     the `sub` claim
+    /// - SPIFFE:   the SPIFFE ID URI
+    /// - mTLS:     the certificate CN
+    #[serde(with = "serde_regex")]
+    IdentitySubject(Regex),
+    /// Matches if ANY of the verified identity's groups satisfies the regex.
+    /// Groups are populated from OIDC claims; empty for API keys and mTLS.
+    #[serde(with = "serde_regex")]
+    IdentityGroup(Regex),
+    /// Matches if the SPIFFE ID satisfies the regex. Only relevant when the
+    /// client authenticates via a SPIFFE SVID.
+    #[serde(with = "serde_regex")]
+    SpiffeId(Regex),
+    /// Matches if the auth method is one of the listed strings.
+    /// Valid values: `"ApiKey"`, `"OidcBearer"`, `"SpiffeSvid"`, `"MtlsCertificate"`.
+    AuthMethod(Vec<String>),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,6 +77,17 @@ pub struct AllowTunnelConfig {
 
     #[serde(default = "default_cidr")]
     pub cidr: Vec<IpNet>,
+
+    /// Maximum number of simultaneously open tunnels for a single identity
+    /// matched by this rule. `0` means unlimited (the default).
+    #[serde(default)]
+    pub max_concurrent_tunnels: u32,
+
+    /// Byte-per-second rate limit applied per tunnel matched by this rule.
+    /// `0` means unlimited (the default). Rate limiting is enforced at the
+    /// bidirectional-copy layer. This field is reserved for Phase 3.
+    #[serde(default)]
+    pub rate_limit_bytes_per_sec: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

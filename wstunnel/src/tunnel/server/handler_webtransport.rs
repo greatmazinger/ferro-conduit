@@ -156,9 +156,19 @@ async fn handle_session(
         return Ok(());
     }
 
+    let identity = match server.extract_identity(&session_headers) {
+        Ok(identity) => identity,
+        Err(()) => {
+            warn!("Rejecting webtransport session from {client_addr} without a valid API key");
+            let _ = request.reject(StatusCode::BAD_REQUEST).await;
+            return Ok(());
+        }
+    };
+
     let allowed = matches_any_restriction(
         path_prefix,
         session_headers.get(AUTHORIZATION).and_then(|auth| auth.to_str().ok()),
+        identity.as_ref(),
         &restrictions.load(),
     );
     if !allowed {
