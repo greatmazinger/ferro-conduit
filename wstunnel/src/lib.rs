@@ -1,6 +1,7 @@
 pub mod config;
 mod embedded_certificate;
 pub mod executor;
+pub mod identity;
 mod protocols;
 mod restrictions;
 mod somark;
@@ -582,6 +583,7 @@ async fn run_server_impl(args: ServerCreationRequest, executor: impl TokioExecut
         // wts:// on the server means "TLS, and also serve webtransport", so it implies the flag.
         // The TCP listener still runs, serving websocket and http2 as usual.
         enable_webtransport: args.enable_webtransport || is_webtransport,
+        api_keys: crate::identity::api_keys::ApiKeyValidator::from_config(&args.api_key)?,
     };
     let server = Server::new(server_config, executor);
 

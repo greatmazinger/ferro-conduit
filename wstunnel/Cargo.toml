@@ -20,6 +20,7 @@ futures-util = { version = "0.3.34" }
 ppp = { version = "2.3.0", features = [] }
 async-channel = { version = "2.5.0", features = [] }
 arc-swap = { version = "1.9.2", features = [] }
+dashmap = { version = "6.1.0", features = [] }
 
 # For config file parsing
 regex = { version = "1.13.1", default-features = false, features = ["std", "perf"] }

@@ -1,4 +1,6 @@
 use crate::executor::DefaultTokioExecutor;
+use crate::identity::VerifiedIdentity;
+use crate::identity::api_keys::ApiKeyValidator;
 use crate::protocols;
 use crate::protocols::dns::DnsResolver;
 use crate::protocols::tls;
@@ -25,9 +27,10 @@ use arc_swap::ArcSwap;
 use futures_util::FutureExt;
 use http_body_util::Either;
 use hyper::body::Incoming;
+use hyper::header::AUTHORIZATION;
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
-use hyper::{Request, StatusCode, Version, http};
+use hyper::{HeaderMap, Request, StatusCode, Version, http};
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use parking_lot::Mutex;
 use socket2::SockRef;
@@ -70,6 +73,9 @@ pub struct ServerConfig {
     /// Additionally serve WebTransport over UDP on the same port as the TCP listener.
     /// Requires TLS, since QUIC mandates TLS 1.3.
     pub enable_webtransport: bool,
+    /// Static API keys. When non-empty, every tunnel request must carry a valid key in
+    /// `Authorization: ApiKey <value>`.
+    pub api_keys: ApiKeyValidator,
 }
 
 #[derive(Clone)]
@@ -84,6 +90,24 @@ impl<E: crate::TokioExecutorRef> Server<E> {
             config: Arc::new(config),
             executor,
         }
+    }
+
+    /// Resolve the identity of the caller from the request headers.
+    ///
+    /// `Ok(None)` means no identity validator is enabled. `Err(())` means the request must be
+    /// rejected: API keys are configured and the request does not carry a valid one.
+    pub(super) fn extract_identity(&self, headers: &HeaderMap) -> Result<Option<VerifiedIdentity>, ()> {
+        if self.config.api_keys.is_empty() {
+            return Ok(None);
+        }
+
+        headers
+            .get(AUTHORIZATION)
+            .and_then(|header| header.to_str().ok())
+            .and_then(|header| header.strip_prefix("ApiKey "))
+            .and_then(|key| self.config.api_keys.validate(key.trim()))
+            .map(Some)
+            .ok_or(())
     }
 
     /// Validate an incoming tunnel request and open the tunnel to its destination.
@@ -126,6 +150,14 @@ impl<E: crate::TokioExecutorRef> Server<E> {
             return Err(bad_request());
         }
 
+        let identity = self.extract_identity(req.headers()).map_err(|()| {
+            warn!("Rejecting connection without a valid API key");
+            bad_request()
+        })?;
+        if let Some(identity) = &identity {
+            info!("Request authenticated as {} via {}", identity.subject, identity.auth_method);
+        }
+
         let jwt = extract_tunnel_info(req).map_err(|err| {
             warn!("{}", err);
             bad_request()
@@ -139,10 +171,11 @@ impl<E: crate::TokioExecutorRef> Server<E> {
         })?;
 
         let authorization = extract_authorization(req);
-        let restriction = validate_tunnel(&remote, path_prefix, authorization, &restrictions).ok_or_else(|| {
-            warn!("Rejecting connection with not allowed destination: {remote:?}");
-            bad_request()
-        })?;
+        let restriction = validate_tunnel(&remote, path_prefix, authorization, identity.as_ref(), &restrictions)
+            .ok_or_else(|| {
+                warn!("Rejecting connection with not allowed destination: {remote:?}");
+                bad_request()
+            })?;
         info!("Tunnel accepted due to matched restriction: {}", restriction.name);
 
         let req_protocol = remote.protocol.clone();
@@ -589,6 +622,7 @@ impl Debug for ServerConfig {
             .field("tls", &self.tls.is_some())
             .field("remote_server_idle_timeout", &self.remote_server_idle_timeout)
             .field("enable_webtransport", &self.enable_webtransport)
+            .field("api_keys", &self.api_keys)
             .field(
                 "mTLS",
                 &self

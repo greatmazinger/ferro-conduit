@@ -362,6 +362,13 @@ pub struct ServerCreationRequest {
     #[cfg_attr(feature = "clap", arg(long, verbatim_doc_comment))]
     pub restrict_config: Option<PathBuf>,
 
+    /// Static API key a client can authenticate with, as NAME=VALUE. Can be specified multiple times.
+    /// When at least one key is set, every client must send the header `Authorization: ApiKey <VALUE>`
+    /// (e.g. with `-H "Authorization: ApiKey <VALUE>"` on the client), else its connection is rejected.
+    /// NAME identifies the client in logs and can be matched in restriction rules with `!ApiKey "<regex>"`.
+    #[cfg_attr(feature = "clap", arg(long, value_name = "NAME=VALUE", verbatim_doc_comment))]
+    pub api_key: Vec<String>,
+
     /// [Optional] Use custom certificate (pem) instead of the default embedded self-signed certificate.
     /// The certificate will be automatically reloaded if it changes
     #[cfg_attr(feature = "clap", arg(long, value_name = "FILE_PATH", verbatim_doc_comment))]
